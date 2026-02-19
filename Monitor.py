@@ -39,6 +39,10 @@ XT_ZENDESK_SECTION_ID = "900000084163"
 XT_ZENDESK_ARTICLES_API = f"https://xtsupport.zendesk.com/api/v2/help_center/en-us/sections/{XT_ZENDESK_SECTION_ID}/articles.json"
 XT_POLL_INTERVAL_SEC = 6
 
+# Upbit notices API (new listings)
+UPBIT_NOTICES_URL = "https://api-manager.upbit.com/api/v1/notices"
+UPBIT_POLL_INTERVAL_SEC = 10
+
 # KuCoin announcements API (new listings)
 KUCOIN_ANN_URL = "https://api.kucoin.com/api/v3/announcements"
 KUCOIN_LANG = "en_US"
@@ -69,6 +73,9 @@ XT_LOCK = threading.Lock()
 SEEN_KUCOIN_IDS = set()
 KUCOIN_LOCK = threading.Lock()
 
+SEEN_UPBIT_IDS = set()
+UPBIT_LOCK = threading.Lock()
+
 # --- TELEGRAM SEND QUEUE ---
 # items are (text, parse_mode_or_none)
 TELE_Q: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=5000)
@@ -94,7 +101,7 @@ _ringer_thread: Optional[threading.Thread] = None
 
 # --- FILTERS ---
 IGNORE_WORDS = {
-    "XT", "KUCOIN", "KCS",
+    "XT", "KUCOIN", "KCS", "UPBIT",
     "BINANCE", "BYBIT", "WILL", "SUPPORT", "THE", "AND", "FOR", "WITH", "YOUR", "FROM", "THIS",
     "THAT", "OPEN", "CLOSE", "DAILY", "WEEKLY", "MONTHLY", "YEAR", "EARN", "SPOT",
     "MARGIN", "FUTURES", "CRYPTO", "TOKEN", "COIN", "LIST", "DELIST", "MAINTENANCE",
@@ -104,7 +111,7 @@ IGNORE_WORDS = {
     "USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "EUR", "GBP", "TRY", "RUB", "AUD", "CAD",
     "MAINNET", "INTEGRATION", "SERVICES", "TRADING", "PAIRS", "ROUNDS", "SHARE", "REWARDS",
     "WORTH", "CAMPAIGN", "COMPETITION", "UNLOCK", "MEGA", "SIMPLE", "LOCKED", "PRODUCTS",
-    "VOTE", "USER", "USERS", "RULES", "TERMS", "PRIZE", "POOL", "DISTRIBUTION", "MARKET"
+    "VOTE", "USER", "USERS", "RULES", "TERMS", "PRIZE", "POOL", "DISTRIBUTION", "MARKET", "KRW"
 }
 TOPIC_CRYPTOS = {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX"}
 
@@ -637,6 +644,103 @@ def fetch_kucoin_new_listings(session: requests.Session, page_size: int = 20):
     return (data.get("data") or {}).get("items", [])
 
 
+# ------------------------
+# Upbit: fetch notices via Upbit API manager
+# NOTE: URL https://api-manager.upbit.com/api/v1/notices needs verification via browser
+#       DevTools on https://upbit.com/service_center/notice — update UPBIT_NOTICES_URL if
+#       the actual endpoint differs. Field names (id, title, created_at, url) may also vary.
+# ------------------------
+def fetch_upbit_notices(session: requests.Session, per_page: int = 20):
+    params = {"locale": "en", "page": 1, "per_page": per_page}
+    resp = session.get(UPBIT_NOTICES_URL, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        inner = data.get("data") or data
+        return inner.get("list") or inner.get("notices") or []
+    return []
+
+
+def monitor_upbit():
+    safe_log("[STATUS] Upbit Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            notices = fetch_upbit_notices(session, per_page=20)
+
+            for notice in notices[:20]:
+                notice_id = str(notice.get("id") or notice.get("notice_id") or "")
+                if not notice_id:
+                    continue
+
+                with UPBIT_LOCK:
+                    if notice_id in SEEN_UPBIT_IDS:
+                        continue
+
+                title = notice.get("title") or ""
+
+                # Only process new-listing notices; Upbit English titles follow:
+                # "Market Support for Xyz(XYZ) (KRW, BTC, USDT Market)"
+                if "Market Support for" not in title:
+                    with UPBIT_LOCK:
+                        SEEN_UPBIT_IDS.add(notice_id)
+                    continue
+
+                raw_ts = notice.get("created_at") or notice.get("createdAt") or ""
+                ts_ms = 0
+                if raw_ts:
+                    try:
+                        ts_ms = iso_to_ms(str(raw_ts))
+                    except Exception:
+                        ts_ms = 0
+
+                if ts_ms and _is_too_old(ts_ms):
+                    with UPBIT_LOCK:
+                        SEEN_UPBIT_IDS.add(notice_id)
+                    continue
+
+                url = notice.get("url") or f"https://upbit.com/service_center/notice?id={notice_id}"
+
+                # Filter TOPIC_CRYPTOS so BTC from "(KRW, BTC, USDT Market)" doesn't appear as a match
+                tickers = [t for t in extract_tickers(title) if t not in TOPIC_CRYPTOS]
+
+                if tickers:
+                    passed_parts = []
+                    for t in tickers:
+                        allowed, bin_ok, byb_ok, _ = passes_futures_gate("UPBIT", t, session)
+                        if allowed:
+                            passed_parts.append(format_token_flags(t, bin_ok, byb_ok))
+
+                    if passed_parts:
+                        date_str = get_utc3_time(ts_ms) if ts_ms else get_utc3_time()
+                        safe_log("[MATCH] Upbit passed: " + ", ".join([re.sub(r"<.*?>", "", p) for p in passed_parts]))
+
+                        safe_title = html.escape(title, quote=False)
+                        safe_url = html.escape(url, quote=True)
+
+                        msg = (
+                            f"*** UPBIT ALERT ***\n"
+                            f"Time: {html.escape(date_str)} (UTC+3)\n"
+                            f"Token: {', '.join(passed_parts)}\n"
+                            f"Title: {safe_title}\n"
+                            f"<a href=\"{safe_url}\">[Link] Open Announcement</a>"
+                        )
+                        send_telegram_msg(msg, parse_mode="HTML")
+                        trigger_ringer()
+                    else:
+                        safe_log(f"[SKIP] Upbit: no tickers passed. Extracted={tickers}")
+
+                with UPBIT_LOCK:
+                    SEEN_UPBIT_IDS.add(notice_id)
+
+            time.sleep(UPBIT_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[UPBIT ERROR] {e}")
+            time.sleep(10)
+
+
 def monitor_kucoin():
     safe_log("[STATUS] KuCoin Poller Started")
     session = get_session()
@@ -729,7 +833,7 @@ def telegram_listener():
                                 f"State: RUNNING\n"
                                 f"Time: {get_utc3_time()} (UTC+3)\n"
                                 f"Filter: <= 1 hour\n"
-                                f"Gate: XT/KuCoin allow Binance USD-M OR Bybit Perp\n"
+                                f"Gate: XT/KuCoin/Upbit allow Binance USD-M OR Bybit Perp\n"
                                 f"Gate: Bybit announcements require Binance USD-M\n"
                                 f"Ringer: {ringer_status()}\n"
                                 f"Commands: /status, /stop"
@@ -836,7 +940,7 @@ def on_open(ws):
     safe_log("[STATUS] Connected to SAPI Stream (Layer 1)")
     send_telegram_msg(
         "[SYSTEM] Bot Online (Cloud)\n"
-        "Monitoring Binance + Bybit + XT + KuCoin.\n"
+        "Monitoring Binance + Bybit + XT + KuCoin + Upbit.\n"
         "Commands: /status, /stop",
         parse_mode=None,
     )
@@ -895,7 +999,7 @@ if __name__ == "__main__":
         f"[SYSTEM] Bot starting...\n"
         f"Time: {get_utc3_time()} (UTC+3)\n"
         f"Filter: <= 1 hour\n"
-        f"Gate: XT/KuCoin allow Binance USD-M OR Bybit Perp\n"
+        f"Gate: XT/KuCoin/Upbit allow Binance USD-M OR Bybit Perp\n"
         f"Gate: Bybit announcements require Binance USD-M\n"
         f"Commands: /status, /stop",
         parse_mode=None,
@@ -906,6 +1010,7 @@ if __name__ == "__main__":
     threading.Thread(target=monitor_bybit, daemon=True).start()
     threading.Thread(target=monitor_xt, daemon=True).start()
     threading.Thread(target=monitor_kucoin, daemon=True).start()
+    threading.Thread(target=monitor_upbit, daemon=True).start()
     threading.Thread(target=monitor_binance_poll, daemon=True).start()
     threading.Thread(target=run_public_ws, daemon=True).start()
 

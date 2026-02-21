@@ -67,8 +67,8 @@ BINGX_ZENDESK_ARTICLES_API = "https://bingxservice.zendesk.com/api/v2/help_cente
 GATE_NEWLISTED_URL = "https://www.gate.com/announcements/newlisted"
 MEXC_NEWLISTINGS_URL = "https://www.mexc.com/announcements/new-listings"
 
-# Upbit notice page (web scraping; request with ?language=en for English titles)
-UPBIT_NOTICE_URL = "https://upbit.com/service_center/notice"
+# Upbit: backend JSON API (the notice page is a React SPA; use the raw API)
+UPBIT_NOTICE_API = "https://api.upbit.com/v1/notices"
 
 # Binance USDⓈ-M Futures exchangeInfo (public)
 FAPI_EXCHANGEINFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -1019,63 +1019,21 @@ def monitor_mexc():
             time.sleep(5)
 
 # ============================================================
-# Upbit notice page scraper
+# Upbit JSON API monitor
 # Only fire on: "Market Support for CoinName(TICKER) (KRW, BTC, USDT Market)"
-# Request English via ?language=en param + Accept-Language header.
+# The notice page is a React SPA so we call the backing JSON API directly.
+# Language is requested via Accept-Language header; Upbit returns English
+# titles when the header is set to en-US.
 # ============================================================
 UPBIT_LISTING_RE = re.compile(
     r"Market\s+Support\s+for\s+.+?\([A-Z0-9]+\)\s*\(",
     re.IGNORECASE,
 )
 
-def _upbit_fetch_article_ids(html_text: str) -> List[str]:
-    # href="/service_center/notice?id=XXXXX"
-    ids = re.findall(r'href="[^"]*service_center/notice[^"]*[?&]id=(\d+)"', html_text)
-    # Alternative path format: /service_center/notice/XXXXX
-    ids += re.findall(r'href="/service_center/notice/(\d+)"', html_text)
-    out: List[str] = []
-    seen: Set[str] = set()
-    for x in ids:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-def _upbit_fetch_article(session: requests.Session, aid: str) -> Tuple[str, int, str]:
-    url = f"https://upbit.com/service_center/notice?id={aid}&language=en"
-    r = session.get(url, headers={"Accept-Language": "en-US,en;q=0.9"}, timeout=20)
-    r.raise_for_status()
-    t = r.text
-
-    m_title = re.search(r"<h1[^>]*>(.*?)</h1>", t, flags=re.S | re.I)
-    if m_title:
-        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", m_title.group(1))).strip()
-    else:
-        m2 = re.search(r"<title[^>]*>(.*?)</title>", t, flags=re.S | re.I)
-        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", (m2.group(1) if m2 else ""))).strip()
-
-    ts_ms = 0
-    m_meta = re.search(r'article:published_time"\s+content="([^"]+)"', t)
-    if m_meta:
-        try:
-            ts_ms = iso_to_ms(m_meta.group(1))
-        except Exception:
-            ts_ms = 0
-
-    if not ts_ms:
-        # Upbit often shows dates as "YYYY.MM.DD HH:MM:SS" or "YYYY-MM-DD HH:MM:SS"
-        m_dt = re.search(r"(\d{4}[.\-]\d{2}[.\-]\d{2})\s+(\d{2}:\d{2}:\d{2})", t)
-        if m_dt:
-            raw = m_dt.group(1).replace(".", "-") + " " + m_dt.group(2)
-            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            ts_ms = int(dt.timestamp() * 1000)
-
-    return title, ts_ms, url
-
 def monitor_upbit():
     safe_log("[STATUS] Upbit Poller Started")
     session = get_plain_session()
-    lang_headers = {"Accept-Language": "en-US,en;q=0.9"}
+    headers = {"Accept-Language": "en-US,en;q=0.9"}
     cooldown = 0
 
     while True:
@@ -1084,38 +1042,62 @@ def monitor_upbit():
                 time.sleep(cooldown)
                 cooldown = 0
 
-            r = session.get(
-                UPBIT_NOTICE_URL,
-                params={"language": "en"},
-                headers=lang_headers,
+            resp = session.get(
+                UPBIT_NOTICE_API,
+                params={"page": 1, "per_page": 20},
+                headers=headers,
                 timeout=20,
             )
-            r.raise_for_status()
-            ids = _upbit_fetch_article_ids(r.text)
+            resp.raise_for_status()
+            data = resp.json()
 
-            new_fetches = 0
-            for aid in ids[:20]:
-                if _seen_once(f"UPBIT_ID:{aid}"):
+            # Unwrap whichever nesting the API uses
+            items: list = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                inner = data.get("data") or data
+                if isinstance(inner, list):
+                    items = inner
+                elif isinstance(inner, dict):
+                    items = (
+                        inner.get("list")
+                        or inner.get("items")
+                        or inner.get("notices")
+                        or []
+                    )
+
+            if not items:
+                safe_log(
+                    f"[UPBIT DEBUG] 0 notices — raw keys: "
+                    f"{list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+                )
+
+            for notice in items[:20]:
+                if not isinstance(notice, dict):
                     continue
-                if new_fetches >= 6:
-                    break
-                try:
-                    title, ts_ms, url = _upbit_fetch_article(session, aid)
-                    if not title:
-                        continue
-                    # Strict filter: only "Market Support for X(XYZ) (KRW..." titles
-                    if not UPBIT_LISTING_RE.search(title):
-                        continue
-                    handle_alert("UPBIT", aid, title, ts_ms, url)
-                    new_fetches += 1
-                except Exception:
+
+                nid = str(notice.get("id") or notice.get("notice_id") or "")
+                title = (notice.get("title") or "").strip()
+                ts_raw = notice.get("created_at") or notice.get("published_at") or 0
+                url = f"https://upbit.com/service_center/notice?id={nid}&language=en"
+
+                ts_ms = normalize_epoch_to_ms(ts_raw)
+
+                if not nid or not title:
                     continue
+
+                # Strict filter — only new-listing announcements
+                if not UPBIT_LISTING_RE.search(title):
+                    continue
+
+                handle_alert("UPBIT", nid, title, ts_ms, url)
 
             time.sleep(UPBIT_POLL_INTERVAL_SEC + random.uniform(0.0, 3.0))
 
         except Exception as e:
             safe_log(f"[UPBIT ERROR] {e}")
-            if "403" in str(e):
+            if "403" in str(e) or "404" in str(e):
                 cooldown = 60 + random.randint(0, 30)
             else:
                 cooldown = 10
@@ -1162,6 +1144,29 @@ def telegram_listener():
 
         except Exception:
             time.sleep(5)
+
+# =========================
+# BINANCE SAPI WS (Layer 1 — background, best-effort)
+# =========================
+def monitor_binance_sapi():
+    """
+    Attempt the unofficial Binance SAPI announcement WebSocket.
+    Layers 2 (public WS) and 3 (REST poll) already cover Binance, so this
+    is strictly additive. If the endpoint keeps rejecting us we back off to
+    60 s between attempts so it doesn't flood the log.
+    """
+    while True:
+        try:
+            ws_url = get_sapi_url()
+            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+            ws = websocket.WebSocketApp(
+                ws_url, header=headers, on_open=on_open, on_message=on_sapi_msg
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            safe_log("[SAPI RESTART] Connection dropped, retrying in 60s...")
+        except Exception as e:
+            safe_log(f"[SAPI RESTART] {e}")
+        time.sleep(60)
 
 # =========================
 # MAIN + TEST FLAGS
@@ -1222,18 +1227,8 @@ if __name__ == "__main__":
 
     threading.Thread(target=monitor_binance_poll, daemon=True).start()
     threading.Thread(target=run_public_ws, daemon=True).start()
+    threading.Thread(target=monitor_binance_sapi, daemon=True).start()
 
-    # Main loop (Binance SAPI WS)
+    # Keep the main thread alive — all exchange monitors are daemon threads above.
     while True:
-        try:
-            ws_url = get_sapi_url()
-            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-            ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open, on_message=on_sapi_msg)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-            # run_forever() returns when the connection drops (no exception on a clean server-side close).
-            # Always sleep before reconnecting to prevent a tight spin loop.
-            safe_log("[SAPI RESTART] Connection dropped, reconnecting in 10s...")
-            time.sleep(10)
-        except Exception as e:
-            safe_log(f"[SAPI RESTART] {e}")
-            time.sleep(10)
+        time.sleep(3600)

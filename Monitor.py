@@ -67,6 +67,9 @@ BINGX_ZENDESK_ARTICLES_API = "https://bingxservice.zendesk.com/api/v2/help_cente
 GATE_NEWLISTED_URL = "https://www.gate.com/announcements/newlisted"
 MEXC_NEWLISTINGS_URL = "https://www.mexc.com/announcements/new-listings"
 
+# Upbit notice page (web scraping; request with ?language=en for English titles)
+UPBIT_NOTICE_URL = "https://upbit.com/service_center/notice"
+
 # Binance USDⓈ-M Futures exchangeInfo (public)
 FAPI_EXCHANGEINFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_CACHE_TTL_SEC = 600  # 10 min
@@ -90,6 +93,9 @@ BINGX_POLL_INTERVAL_SEC = 15  # a bit faster now that it's clean JSON
 GATE_POLL_INTERVAL_SEC = 25
 MEXC_POLL_INTERVAL_SEC = 25
 
+# Upbit notice page — slightly slower since it's a consumer-facing site
+UPBIT_POLL_INTERVAL_SEC = 30
+
 # Binance REST poller
 BINANCE_REST_POLL_INTERVAL_SEC = 3
 
@@ -109,7 +115,7 @@ IGNORE_WORDS = {
     "NETWORK", "WALLET", "UPGRADE", "UPDATE", "TIME", "DATE", "NOW", "NEW", "ALL",
     "DEPOSIT", "TRADE", "COMPLETE", "ADDED", "ADD", "LAUNCH", "PROJECT", "REVIEW",
     "REMOVAL", "NOTICE", "PLAN", "OFFLINE", "PERPETUAL", "CONTRACT", "SWAP", "OPTIONS",
-    "USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "EUR", "GBP", "TRY", "RUB", "AUD", "CAD",
+    "USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "EUR", "GBP", "TRY", "RUB", "AUD", "CAD", "KRW",
     "MAINNET", "INTEGRATION", "SERVICES", "TRADING", "PAIRS", "ROUNDS", "SHARE", "REWARDS",
     "WORTH", "CAMPAIGN", "COMPETITION", "UNLOCK", "MEGA", "SIMPLE", "LOCKED", "PRODUCTS",
     "VOTE", "USER", "USERS", "RULES", "TERMS", "PRIZE", "POOL", "DISTRIBUTION", "MARKET",
@@ -132,6 +138,7 @@ SEEN: Dict[str, Set[str]] = {
     "BINGX": set(),
     "GATE": set(),
     "MEXC": set(),
+    "UPBIT": set(),
 }
 
 # Extra early-dedupe keys (for Gate/MEXC fetching loops)
@@ -1006,6 +1013,109 @@ def monitor_mexc():
                 cooldown = 10
             time.sleep(5)
 
+# ============================================================
+# Upbit notice page scraper
+# Only fire on: "Market Support for CoinName(TICKER) (KRW, BTC, USDT Market)"
+# Request English via ?language=en param + Accept-Language header.
+# ============================================================
+UPBIT_LISTING_RE = re.compile(
+    r"Market\s+Support\s+for\s+.+?\([A-Z0-9]+\)\s*\(",
+    re.IGNORECASE,
+)
+
+def _upbit_fetch_article_ids(html_text: str) -> List[str]:
+    # href="/service_center/notice?id=XXXXX"
+    ids = re.findall(r'href="[^"]*service_center/notice[^"]*[?&]id=(\d+)"', html_text)
+    # Alternative path format: /service_center/notice/XXXXX
+    ids += re.findall(r'href="/service_center/notice/(\d+)"', html_text)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def _upbit_fetch_article(session: requests.Session, aid: str) -> Tuple[str, int, str]:
+    url = f"https://upbit.com/service_center/notice?id={aid}&language=en"
+    r = session.get(url, headers={"Accept-Language": "en-US,en;q=0.9"}, timeout=20)
+    r.raise_for_status()
+    t = r.text
+
+    m_title = re.search(r"<h1[^>]*>(.*?)</h1>", t, flags=re.S | re.I)
+    if m_title:
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", m_title.group(1))).strip()
+    else:
+        m2 = re.search(r"<title[^>]*>(.*?)</title>", t, flags=re.S | re.I)
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", (m2.group(1) if m2 else ""))).strip()
+
+    ts_ms = 0
+    m_meta = re.search(r'article:published_time"\s+content="([^"]+)"', t)
+    if m_meta:
+        try:
+            ts_ms = iso_to_ms(m_meta.group(1))
+        except Exception:
+            ts_ms = 0
+
+    if not ts_ms:
+        # Upbit often shows dates as "YYYY.MM.DD HH:MM:SS" or "YYYY-MM-DD HH:MM:SS"
+        m_dt = re.search(r"(\d{4}[.\-]\d{2}[.\-]\d{2})\s+(\d{2}:\d{2}:\d{2})", t)
+        if m_dt:
+            raw = m_dt.group(1).replace(".", "-") + " " + m_dt.group(2)
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            ts_ms = int(dt.timestamp() * 1000)
+
+    return title, ts_ms, url
+
+def monitor_upbit():
+    safe_log("[STATUS] Upbit Poller Started")
+    session = get_plain_session()
+    lang_headers = {"Accept-Language": "en-US,en;q=0.9"}
+    cooldown = 0
+
+    while True:
+        try:
+            if cooldown > 0:
+                time.sleep(cooldown)
+                cooldown = 0
+
+            r = session.get(
+                UPBIT_NOTICE_URL,
+                params={"language": "en"},
+                headers=lang_headers,
+                timeout=20,
+            )
+            r.raise_for_status()
+            ids = _upbit_fetch_article_ids(r.text)
+
+            new_fetches = 0
+            for aid in ids[:20]:
+                if _seen_once(f"UPBIT_ID:{aid}"):
+                    continue
+                if new_fetches >= 6:
+                    break
+                try:
+                    title, ts_ms, url = _upbit_fetch_article(session, aid)
+                    if not title:
+                        continue
+                    # Strict filter: only "Market Support for X(XYZ) (KRW..." titles
+                    if not UPBIT_LISTING_RE.search(title):
+                        continue
+                    handle_alert("UPBIT", aid, title, ts_ms, url)
+                    new_fetches += 1
+                except Exception:
+                    continue
+
+            time.sleep(UPBIT_POLL_INTERVAL_SEC + random.uniform(0.0, 3.0))
+
+        except Exception as e:
+            safe_log(f"[UPBIT ERROR] {e}")
+            if "403" in str(e):
+                cooldown = 60 + random.randint(0, 30)
+            else:
+                cooldown = 10
+            time.sleep(5)
+
 # =========================
 # TELEGRAM LISTENER (/status, /stop)
 # =========================
@@ -1103,6 +1213,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=monitor_gate, daemon=True).start()
     threading.Thread(target=monitor_mexc, daemon=True).start()
+    threading.Thread(target=monitor_upbit, daemon=True).start()
 
     threading.Thread(target=monitor_binance_poll, daemon=True).start()
     threading.Thread(target=run_public_ws, daemon=True).start()

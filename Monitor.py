@@ -11,27 +11,38 @@ import sys
 import queue
 import html
 import argparse
+import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple, Set, Dict
+from email.utils import parsedate_to_datetime
+from typing import Optional, Tuple, Set, Dict, List
 
-# --- 🛡️ CRASH PREVENTION: FORCE UTF-8 ---
+# ----------------------------
+# Console safety (UTF-8)
+# ----------------------------
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-# --- CONFIGURATION ---
-BINANCE_API_KEY = 
-BINANCE_SECRET_KEY = 
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+BINANCE_API_KEY = "rlwMpOx5Z7AMvViN1PJjlFZoFQLmkNU6Lpgx3CJeYMUzZUWRX70QFbERWil1akVn"
+BINANCE_SECRET_KEY = "7kYmbK3aflhZ9VEKkYGjNINpyCFQwYiQQItO80vkQ6nSNczghKSflAsjuo3TwKzA"
 
-TELEGRAM_TOKEN = 
-TELEGRAM_CHAT_ID = 
+TELEGRAM_TOKEN = "8298805298:AAFNlSm5TuyQNXfmeZ_mXe5Uhjt7doyc4Lg"
+TELEGRAM_CHAT_ID = "5642266820"
 
-# --- SETTINGS ---
+# ----------------------------
+# SETTINGS / ENDPOINTS
+# ----------------------------
+# Binance announcement streams + poller
 BINANCE_SAPI_TOPIC = "com_announcement_en"
 BINANCE_PUBLIC_WS = "wss://stream.binance.com:9443/ws/all_announcement"
 BINANCE_POLL_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+
+# Bybit announcements
 BYBIT_URL = "https://api.bybit.com/v5/announcements/index"
 
 # XT (Zendesk Help Center) - Tokens and Trading Pairs Listing section
@@ -45,46 +56,65 @@ KUCOIN_LANG = "en_US"
 KUCOIN_ANN_TYPE = "new-listings"
 KUCOIN_POLL_INTERVAL_SEC = 10
 
-# Binance USDⓈ-M Futures exchangeInfo (public)
+# Gate.com new listed announcements
+GATE_NEWLISTED_URL = "https://www.gate.com/announcements/newlisted"
+GATE_POLL_INTERVAL_SEC = 8
+
+# Kraken asset listings RSS
+KRAKEN_ASSET_LISTINGS_RSS = "https://blog.kraken.com/category/product/asset-listings/feed"
+KRAKEN_POLL_INTERVAL_SEC = 20
+
+# WEEX new listings wiki
+WEEX_NEWLISTINGS_URL = "https://www.weex.com/wiki/new-listings"
+WEEX_POLL_INTERVAL_SEC = 12
+
+# BingX Zendesk sections (Spot / Innovation / Futures listing)
+BINGX_ZENDESK_BASE = "https://bingxservice.zendesk.com"
+BINGX_ZENDESK_LOCALE = "en-001"
+BINGX_ZENDESK_API_TMPL = f"{BINGX_ZENDESK_BASE}/api/v2/help_center/{BINGX_ZENDESK_LOCALE}/sections/{{sid}}/articles.json"
+BINGX_POLL_INTERVAL_SEC = 8
+BINGX_SECTIONS = {
+    "BINGX_SPOT": "11257060005007",        # Spot Listing
+    "BINGX_INNOVATION": "13117025062927",  # Innovation Listing
+    "BINGX_FUTURES": "11257015822991",     # Futures Listing (best-guess; will log if not found)
+}
+
+# Bitget new listings category page
+BITGET_NEWLISTINGS_URL = "https://www.bitget.com/support/categories/11865590960081"
+BITGET_POLL_INTERVAL_SEC = 10
+
+# MEXC announcements (new listings)
+MEXC_NEWLISTINGS_URL = "https://www.mexc.com/announcements/new-listings"
+MEXC_POLL_INTERVAL_SEC = 10
+
+# ----------------------------
+# FUTURES GATE (Binance USDⓈ-M OR MEXC Futures)
+# ----------------------------
 FAPI_EXCHANGEINFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-FUTURES_CACHE_TTL_SEC = 600  # 10 minutes cache
+BINANCE_FUTURES_CACHE_TTL_SEC = 600  # 10 min
 
-# Bybit Perp instruments (public)
-BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
-BYBIT_PERP_CACHE_TTL_SEC = 600  # per-ticker cache
+# MEXC futures contracts (public)
+# NOTE: This is the commonly used public endpoint for MEXC contracts.
+# If MEXC changes it, only this constant + parsing function needs adjustment.
+MEXC_CONTRACT_DETAIL_URL = "https://contract.mexc.com/api/v1/contract/detail"
+MEXC_FUTURES_CACHE_TTL_SEC = 600  # 10 min
 
-# --- CONTROL FLAGS ---
-BOT_ACTIVE = True
+# ----------------------------
+# GLOBAL RULES
+# ----------------------------
+MAX_AGE = timedelta(hours=1)  # <= 1 hour
 
-# --- 1 HOUR FILTER ---
-MAX_AGE = timedelta(hours=1)
-
-# --- DEDUPE (THREAD-SAFE) ---
-SEEN_CODES = set()
-SEEN_LOCK = threading.Lock()
-
-SEEN_XT_IDS = set()
-XT_LOCK = threading.Lock()
-
-SEEN_KUCOIN_IDS = set()
-KUCOIN_LOCK = threading.Lock()
-
-# --- TELEGRAM SEND QUEUE ---
+# ----------------------------
+# TELEGRAM SEND QUEUE (IMPORTANT)
+# ----------------------------
 # items are (text, parse_mode_or_none)
 TELE_Q: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=5000)
 
-# --- BINANCE FUTURES CACHE (THREAD-SAFE) ---
-_futures_cache_lock = threading.Lock()
-_futures_cache_loaded_at = 0
-_futures_base_to_quotes: Dict[str, Set[str]] = {}
-
-# --- BYBIT PERP CACHE (PER-TICKER) ---
-_bybit_perp_lock = threading.Lock()
-_bybit_perp_cache: Dict[str, Tuple[int, bool, Set[str]]] = {}  # ticker -> (checked_at, ok, symbols)
-
-# --- RINGER (REMINDER SPAM) ---
+# ----------------------------
+# RINGER
+# ----------------------------
 RINGER_MESSAGE = "IMPORTANT: Recent Match Found, please /stop to stop the reminder"
-RINGER_INTERVAL_SEC = 2   # <--- change to 1 if you want every 1s
+RINGER_INTERVAL_SEC = 2      # <-- change this to 1, 2, etc.
 RINGER_MAX_SECONDS = 120
 
 _ringer_lock = threading.Lock()
@@ -92,10 +122,34 @@ _ringer_until_ts = 0.0
 _ringer_stop_event = threading.Event()
 _ringer_thread: Optional[threading.Thread] = None
 
-# --- FILTERS ---
+# ----------------------------
+# DEDUPE (THREAD-SAFE)
+# ----------------------------
+SEEN_LOCK = threading.Lock()
+SEEN_GLOBAL: Set[str] = set()
+
+# ----------------------------
+# FUTURES CACHE (THREAD-SAFE)
+# ----------------------------
+_bin_fut_lock = threading.Lock()
+_bin_fut_loaded_at = 0
+_bin_base_to_quotes: Dict[str, Set[str]] = {}
+
+_mexc_fut_lock = threading.Lock()
+_mexc_fut_loaded_at = 0
+_mexc_bases: Set[str] = set()
+_mexc_symbols_by_base: Dict[str, Set[str]] = {}
+
+# ----------------------------
+# FILTERS
+# ----------------------------
 IGNORE_WORDS = {
-    "XT", "KUCOIN", "KCS",
-    "BINANCE", "BYBIT", "WILL", "SUPPORT", "THE", "AND", "FOR", "WITH", "YOUR", "FROM", "THIS",
+    # Exchange names / noise that can appear in titles
+    "XT", "KUCOIN", "KCS", "WEEX", "BINGX", "BITGET", "GATE", "KRAKEN", "MEXC",
+    "BINANCE", "BYBIT",
+
+    # Common words
+    "WILL", "SUPPORT", "THE", "AND", "FOR", "WITH", "YOUR", "FROM", "THIS",
     "THAT", "OPEN", "CLOSE", "DAILY", "WEEKLY", "MONTHLY", "YEAR", "EARN", "SPOT",
     "MARGIN", "FUTURES", "CRYPTO", "TOKEN", "COIN", "LIST", "DELIST", "MAINTENANCE",
     "NETWORK", "WALLET", "UPGRADE", "UPDATE", "TIME", "DATE", "NOW", "NEW", "ALL",
@@ -104,14 +158,13 @@ IGNORE_WORDS = {
     "USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "EUR", "GBP", "TRY", "RUB", "AUD", "CAD",
     "MAINNET", "INTEGRATION", "SERVICES", "TRADING", "PAIRS", "ROUNDS", "SHARE", "REWARDS",
     "WORTH", "CAMPAIGN", "COMPETITION", "UNLOCK", "MEGA", "SIMPLE", "LOCKED", "PRODUCTS",
-    "VOTE", "USER", "USERS", "RULES", "TERMS", "PRIZE", "POOL", "DISTRIBUTION", "MARKET"
+    "VOTE", "USER", "USERS", "RULES", "TERMS", "PRIZE", "POOL", "DISTRIBUTION", "MARKET",
 }
 TOPIC_CRYPTOS = {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX"}
 
-
-# ------------------------
+# ----------------------------
 # Helpers
-# ------------------------
+# ----------------------------
 def safe_log(message: str):
     try:
         clean_msg = message.encode("ascii", "ignore").decode("ascii")
@@ -153,12 +206,13 @@ def telegram_sender():
             for attempt in range(6):
                 try:
                     r = session.post(url, json=payload, timeout=10)
-                    if r.status_code >= 400:
-                        safe_log(f"[TELEGRAM HTTP {r.status_code}] {r.text}")
 
+                    # Hard errors: bad request/unauthorized/forbidden -> don't retry
                     if r.status_code in (400, 401, 403):
+                        safe_log(f"[TELEGRAM HTTP {r.status_code}] {r.text}")
                         break
 
+                    # Rate limit
                     if r.status_code == 429:
                         try:
                             j = r.json()
@@ -168,6 +222,7 @@ def telegram_sender():
                         time.sleep(min(max(wait, 1), 60))
                         continue
 
+                    # Server errors
                     if r.status_code >= 500:
                         time.sleep(min(2 ** attempt, 30))
                         continue
@@ -175,6 +230,8 @@ def telegram_sender():
                     if r.ok:
                         break
 
+                    # Other retryable client-ish errors
+                    safe_log(f"[WARN] Telegram send failed (attempt {attempt+1}/6): HTTP {r.status_code}")
                     time.sleep(min(2 ** attempt, 30))
 
                 except requests.RequestException as e:
@@ -197,7 +254,7 @@ def get_utc3_time(timestamp_ms: Optional[int] = None):
     return (dt_utc + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _is_too_old(timestamp_ms: int) -> bool:
+def _is_too_old_ms(timestamp_ms: int) -> bool:
     try:
         dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
         return (datetime.now(timezone.utc) - dt) > MAX_AGE
@@ -210,18 +267,42 @@ def iso_to_ms(iso_str: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def extract_tickers(text: str):
-    # No numbers in screening: only A-Z tickers
+def weex_dt_to_ms(dt_str: str) -> int:
+    # Example from WEEX page: 2025/12/26 07:40:00
+    # Treat as UTC if not specified.
+    dt = datetime.strptime(dt_str.strip(), "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def extract_tickers(text: str) -> List[str]:
+    """
+    No numbers in screening: only A-Z tickers.
+    """
     safe_text = re.sub(r"[^A-Za-z\s\(\)]", "", text)
     bracket_matches = re.findall(r"\(([A-Z]{2,15})\)", safe_text)
     loose_matches = re.findall(r"\b[A-Z]{2,10}\b", safe_text)
     all_potential = bracket_matches + loose_matches
-    return list(set([t for t in all_potential if t not in IGNORE_WORDS]))
+    tickers = list(set([t for t in all_potential if t not in IGNORE_WORDS]))
+    return tickers
 
 
-# ------------------------
+def should_consider(tickers: List[str]) -> bool:
+    if not tickers:
+        return False
+    return any(t not in TOPIC_CRYPTOS for t in tickers)
+
+
+def _seen_once(key: str) -> bool:
+    with SEEN_LOCK:
+        if key in SEEN_GLOBAL:
+            return True
+        SEEN_GLOBAL.add(key)
+        return False
+
+
+# ----------------------------
 # RINGER
-# ------------------------
+# ----------------------------
 def _ringer_loop():
     while True:
         with _ringer_lock:
@@ -262,11 +343,11 @@ def ringer_status() -> str:
     return f"ON ({int(remaining)}s left)"
 
 
-# ------------------------
-# Binance USDⓈ-M Futures availability (cached)
-# ------------------------
-def _refresh_futures_cache(session: requests.Session):
-    global _futures_cache_loaded_at, _futures_base_to_quotes
+# ----------------------------
+# Binance USDⓈ-M Futures cache
+# ----------------------------
+def _refresh_binance_futures_cache(session: requests.Session):
+    global _bin_fut_loaded_at, _bin_base_to_quotes
     resp = session.get(FAPI_EXCHANGEINFO_URL, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -281,162 +362,186 @@ def _refresh_futures_cache(session: requests.Session):
             continue
         base_to_quotes.setdefault(base, set()).add(quote)
 
-    _futures_base_to_quotes = base_to_quotes
-    _futures_cache_loaded_at = int(time.time())
+    _bin_base_to_quotes = base_to_quotes
+    _bin_fut_loaded_at = int(time.time())
 
 
-def is_on_binance_usdm_futures(ticker: str, session: requests.Session) -> bool:
+def binance_usdm_quotes_for(ticker: str, session: requests.Session) -> Set[str]:
     now = int(time.time())
-    with _futures_cache_lock:
-        if (now - _futures_cache_loaded_at) > FUTURES_CACHE_TTL_SEC or not _futures_base_to_quotes:
-            _refresh_futures_cache(session)
-        return ticker in _futures_base_to_quotes and len(_futures_base_to_quotes[ticker]) > 0
+    with _bin_fut_lock:
+        if (now - _bin_fut_loaded_at) > BINANCE_FUTURES_CACHE_TTL_SEC or not _bin_base_to_quotes:
+            _refresh_binance_futures_cache(session)
+        return set(_bin_base_to_quotes.get(ticker, set()))
 
 
-def futures_quotes_for(ticker: str, session: requests.Session):
-    now = int(time.time())
-    with _futures_cache_lock:
-        if (now - _futures_cache_loaded_at) > FUTURES_CACHE_TTL_SEC or not _futures_base_to_quotes:
-            _refresh_futures_cache(session)
-        return _futures_base_to_quotes.get(ticker, set())
-
-
-# ------------------------
-# Bybit Perpetual Futures (USDT-linear) availability (per-ticker cache)
-# ------------------------
-def bybit_usdt_perp_symbols(ticker: str, session: requests.Session) -> Tuple[bool, Set[str]]:
+# ----------------------------
+# MEXC futures cache
+# ----------------------------
+def _parse_mexc_contracts(payload: dict) -> List[dict]:
     """
-    Checks if ticker has Bybit USDT-settled perpetual contracts.
-    Uses GET /v5/market/instruments-info?category=linear&baseCoin=TICKER
+    MEXC contract endpoint structures can vary.
+    Try common shapes:
+      - {"success":true,"code":0,"data":[...]}
+      - {"code":0,"data":{"contracts":[...]}}
+    """
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("contracts", "list", "items", "rows"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+    # fallback
+    for k in ("result", "contracts"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
+def _refresh_mexc_futures_cache(session: requests.Session):
+    global _mexc_fut_loaded_at, _mexc_bases, _mexc_symbols_by_base
+    resp = session.get(MEXC_CONTRACT_DETAIL_URL, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    items = _parse_mexc_contracts(data)
+
+    bases: Set[str] = set()
+    syms_by_base: Dict[str, Set[str]] = {}
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+
+        # Try to infer symbol/base/quote
+        sym = (it.get("symbol") or it.get("contractCode") or it.get("symbolName") or "").strip()
+        base = (it.get("baseCoin") or it.get("base") or it.get("baseAsset") or "").strip().upper()
+        quote = (it.get("quoteCoin") or it.get("quote") or it.get("quoteAsset") or "").strip().upper()
+
+        if not base and sym:
+            # Common MEXC format: BTC_USDT
+            m = re.match(r"^([A-Z]{2,15})[_\-]([A-Z]{2,10})$", sym.upper())
+            if m:
+                base = m.group(1)
+                quote = quote or m.group(2)
+
+        # Keep only USDT-ish quoted futures when detectable; otherwise keep anyway
+        if quote and quote not in ("USDT", "USD", "USDC"):
+            continue
+
+        if base:
+            bases.add(base)
+            if sym:
+                syms_by_base.setdefault(base, set()).add(sym.upper())
+
+    _mexc_bases = bases
+    _mexc_symbols_by_base = syms_by_base
+    _mexc_fut_loaded_at = int(time.time())
+
+
+def mexc_symbols_for(ticker: str, session: requests.Session) -> Set[str]:
+    now = int(time.time())
+    with _mexc_fut_lock:
+        if (now - _mexc_fut_loaded_at) > MEXC_FUTURES_CACHE_TTL_SEC or not _mexc_bases:
+            _refresh_mexc_futures_cache(session)
+        return set(_mexc_symbols_by_base.get(ticker, set()))
+
+
+# ----------------------------
+# GATE: Binance USDⓈ-M OR MEXC futures
+# ----------------------------
+def passes_futures_gate(ticker: str, session: requests.Session) -> Tuple[bool, bool, bool, Set[str], Set[str]]:
+    """
+    Returns:
+      allowed, binance_ok, mexc_ok, binance_quotes, mexc_symbols
     """
     ticker = ticker.upper().strip()
-    now = int(time.time())
-
-    with _bybit_perp_lock:
-        cached = _bybit_perp_cache.get(ticker)
-        if cached:
-            checked_at, ok, symbols = cached
-            if (now - checked_at) <= BYBIT_PERP_CACHE_TTL_SEC:
-                return ok, set(symbols)
-
-    ok = False
-    symbols: Set[str] = set()
+    bq = set()
+    ms = set()
 
     try:
-        params = {
-            "category": "linear",
-            "baseCoin": ticker,
-            "limit": 200,
-        }
-        resp = session.get(BYBIT_INSTRUMENTS_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("retCode") == 0:
-            result = data.get("result") or {}
-            items = result.get("list") or []
-            for it in items:
-                # Bybit note: querying baseCoin can return USDT/USDC/inverse; filter to USDT perpetual
-                if (it.get("status") or "") != "Trading":
-                    continue
-                if (it.get("settleCoin") or "") != "USDT":
-                    continue
-                ct = (it.get("contractType") or "")
-                if "Perpetual" not in ct:
-                    continue
-                sym = it.get("symbol")
-                if sym:
-                    symbols.add(sym)
-            ok = len(symbols) > 0
-
+        bq = binance_usdm_quotes_for(ticker, session)
     except Exception:
-        ok = False
-        symbols = set()
-
-    with _bybit_perp_lock:
-        _bybit_perp_cache[ticker] = (now, ok, set(symbols))
-
-    return ok, set(symbols)
-
-
-# ------------------------
-# Gate logic
-# ------------------------
-def passes_futures_gate(source: str, ticker: str, session: requests.Session) -> Tuple[bool, bool, bool, Set[str]]:
-    """
-    Returns (allowed, binance_ok, bybit_ok, bybit_symbols)
-
-    Rules:
-    - For Bybit announcements source: REQUIRE Binance USD-M futures (even if Bybit perp exists).
-      (matches your "Bybit-only shouldn't pass" rule)
-    - For other non-Binance sources (XT/KuCoin): allow if Binance USD-M OR Bybit USDT Perp.
-    """
-    binance_ok = False
-    bybit_ok = False
-    bybit_syms: Set[str] = set()
+        bq = set()
 
     try:
-        binance_ok = is_on_binance_usdm_futures(ticker, session)
+        ms = mexc_symbols_for(ticker, session)
     except Exception:
-        binance_ok = False
+        ms = set()
 
-    try:
-        bybit_ok, bybit_syms = bybit_usdt_perp_symbols(ticker, session)
-    except Exception:
-        bybit_ok, bybit_syms = False, set()
-
-    if source == "BYBIT_ANN":
-        allowed = binance_ok
-    else:
-        allowed = binance_ok or bybit_ok
-
-    return allowed, binance_ok, bybit_ok, bybit_syms
+    bin_ok = len(bq) > 0
+    mex_ok = len(ms) > 0
+    allowed = bin_ok or mex_ok
+    return allowed, bin_ok, mex_ok, bq, ms
 
 
-def format_token_flags(ticker: str, binance_ok: bool, bybit_ok: bool) -> str:
-    b1 = "Binance USD-M ✅" if binance_ok else "Binance USD-M ❌"
-    b2 = "Bybit Perp ✅" if bybit_ok else "Bybit Perp ❌"
+def format_token_flags(ticker: str, bin_ok: bool, mex_ok: bool) -> str:
+    b1 = "Binance USD-M ✅" if bin_ok else "Binance USD-M ❌"
+    b2 = "MEXC Futures ✅" if mex_ok else "MEXC Futures ❌"
     return f"<b>{html.escape(ticker)}</b> ({b1}, {b2})"
 
 
-# ------------------------
-# Central alert processor (Binance)
-# ------------------------
-def process_binance_alert(source, title, code, timestamp, url):
-    with SEEN_LOCK:
-        if code in SEEN_CODES:
-            return
-        SEEN_CODES.add(code)
+# ----------------------------
+# CENTRAL ALERT HANDLER (ALL SOURCES)
+# ----------------------------
+def handle_alert(source: str, uniq_id: str, title: str, ts_ms: int, url: str):
+    """
+    - Dedupe by (source + uniq_id)
+    - <= 1 hour old
+    - extract tickers (letters only)
+    - only consider if contains at least one non-major ticker
+    - gate: Binance USD-M OR MEXC futures
+    - send message + trigger ringer
+    """
+    key = f"{source}:{uniq_id}"
+    if _seen_once(key):
+        return
 
-    if _is_too_old(int(timestamp)):
+    if ts_ms and _is_too_old_ms(int(ts_ms)):
         return
 
     tickers = extract_tickers(title)
-    if any(t not in TOPIC_CRYPTOS for t in tickers):
-        ticker_str = ", ".join(tickers)
-        date_str = get_utc3_time(int(timestamp))
+    if not should_consider(tickers):
+        return
 
-        safe_log(f"[MATCH] {source}: {ticker_str}")
+    session = get_session()  # small session for gate calls (caches reduce load)
 
-        safe_title = html.escape(title, quote=False)
-        safe_ticker = html.escape(ticker_str, quote=False)
-        safe_url = html.escape(url, quote=True)
+    passed_parts = []
+    for t in tickers:
+        if t in TOPIC_CRYPTOS:
+            continue
+        allowed, bin_ok, mex_ok, _, _ = passes_futures_gate(t, session)
+        if allowed:
+            passed_parts.append(format_token_flags(t, bin_ok, mex_ok))
 
-        msg = (
-            f"*** BINANCE ALERT ***\n"
-            f"Method: {html.escape(source)}\n"
-            f"Time: {html.escape(date_str)} (UTC+3)\n"
-            f"Token: <b>{safe_ticker}</b>\n"
-            f"Title: {safe_title}\n"
-            f"<a href=\"{safe_url}\">[Link] Open Announcement</a>"
-        )
-        send_telegram_msg(msg, parse_mode="HTML")
-        trigger_ringer()
+    if not passed_parts:
+        safe_log(f"[SKIP] {source}: no tickers passed gate. Extracted={tickers}")
+        return
+
+    date_str = get_utc3_time(int(ts_ms)) if ts_ms else get_utc3_time()
+
+    safe_title = html.escape(title, quote=False)
+    safe_url = html.escape(url, quote=True)
+
+    msg = (
+        f"*** {html.escape(source)} ALERT ***\n"
+        f"Time: {html.escape(date_str)} (UTC+3)\n"
+        f"Token: {', '.join(passed_parts)}\n"
+        f"Title: {safe_title}\n"
+        f"<a href=\"{safe_url}\">[Link] Open Announcement</a>"
+    )
+    send_telegram_msg(msg, parse_mode="HTML")
+    trigger_ringer()
+    safe_log(f"[MATCH] {source}: " + ", ".join([re.sub(r"<.*?>", "", p) for p in passed_parts]))
 
 
-# ------------------------
-# Thread: Binance REST poller
-# ------------------------
+# ----------------------------
+# Binance REST poller
+# ----------------------------
 def monitor_binance_poll():
     safe_log("[STATUS] Binance Poller Started (Layer 3)")
     session = get_session()
@@ -454,36 +559,24 @@ def monitor_binance_poll():
                 for catalog in data["data"]["catalogs"]:
                     all_articles.extend(catalog.get("articles", []))
 
-            for article in all_articles[:5]:
-                ts = int(article.get("releaseDate", 0))
+            for article in all_articles[:10]:
                 code = str(article.get("code", ""))
-
-                if ts and _is_too_old(ts):
-                    with SEEN_LOCK:
-                        SEEN_CODES.add(code)
-                    continue
-
-                process_binance_alert(
-                    "REST Poller",
-                    article.get("title", ""),
-                    code,
-                    ts,
-                    f"https://www.binance.com/en/support/announcement/{article.get('code')}",
-                )
+                title = article.get("title", "") or ""
+                ts = int(article.get("releaseDate", 0) or 0)
+                url = f"https://www.binance.com/en/support/announcement/{code}" if code else "https://www.binance.com/en/support/announcement"
+                handle_alert("BINANCE", code or title, title, ts, url)
 
             time.sleep(3)
         except Exception:
             time.sleep(5)
 
 
-# ------------------------
-# Thread: Bybit announcements poller
-# ------------------------
+# ----------------------------
+# Bybit announcements poller
+# ----------------------------
 def monitor_bybit():
     safe_log("[STATUS] Bybit Poller Started")
     session = get_session()
-    seen_urls = set()
-
     while True:
         try:
             resp = session.get(
@@ -494,125 +587,42 @@ def monitor_bybit():
             data = resp.json()
 
             if data.get("retCode") == 0:
-                for article in data["result"]["list"]:
-                    url = article.get("url")
-                    if not url or url in seen_urls:
+                for article in (data.get("result") or {}).get("list", []):
+                    url = article.get("url") or ""
+                    title = article.get("title") or ""
+                    ts = int(article.get("dateTimestamp", 0) or 0)
+                    if not url or not title:
                         continue
-
-                    ts = int(article.get("dateTimestamp", 0))
-                    if ts and _is_too_old(ts):
-                        seen_urls.add(url)
-                        continue
-
-                    title = article.get("title", "")
-                    tickers = extract_tickers(title)
-
-                    if any(t not in TOPIC_CRYPTOS for t in tickers):
-                        passed_parts = []
-                        for t in tickers:
-                            allowed, bin_ok, byb_ok, _ = passes_futures_gate("BYBIT_ANN", t, session)
-                            if allowed:
-                                passed_parts.append(format_token_flags(t, bin_ok, byb_ok))
-
-                        if not passed_parts:
-                            safe_log(f"[SKIP] Bybit: no tickers passed (requires Binance USD-M). Extracted={tickers}")
-                            seen_urls.add(url)
-                            continue
-
-                        date_str = get_utc3_time(ts)
-                        safe_log("[MATCH] Bybit passed: " + ", ".join([re.sub(r"<.*?>", "", p) for p in passed_parts]))
-
-                        safe_title = html.escape(title, quote=False)
-                        safe_url = html.escape(url, quote=True)
-
-                        msg = (
-                            f"*** BYBIT ALERT ***\n"
-                            f"Time: {html.escape(date_str)} (UTC+3)\n"
-                            f"Token: {', '.join(passed_parts)}\n"
-                            f"Title: {safe_title}\n"
-                            f"<a href=\"{safe_url}\">[Link] Open Announcement</a>"
-                        )
-                        send_telegram_msg(msg, parse_mode="HTML")
-                        trigger_ringer()
-
-                    seen_urls.add(url)
+                    handle_alert("BYBIT", url, title, ts, url)
 
             time.sleep(5)
         except Exception:
             time.sleep(5)
 
 
-# ------------------------
-# XT: fetch latest listing articles via Zendesk API
-# ------------------------
-def fetch_xt_articles(session: requests.Session, per_page: int = 30):
-    resp = session.get(XT_ZENDESK_ARTICLES_API, params={"per_page": per_page, "page": 1}, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("articles", [])
-
-
+# ----------------------------
+# XT (Zendesk) poller
+# ----------------------------
 def monitor_xt():
     safe_log("[STATUS] XT Poller Started")
     session = get_session()
 
     while True:
         try:
-            articles = fetch_xt_articles(session, per_page=30)
+            resp = session.get(XT_ZENDESK_ARTICLES_API, params={"per_page": 30, "page": 1}, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            articles = data.get("articles", [])
 
-            for a in articles[:15]:
+            for a in articles[:20]:
                 aid = str(a.get("id", ""))
-                if not aid:
+                title = a.get("title") or ""
+                url = a.get("html_url") or a.get("url") or ""
+                created_at = a.get("created_at") or a.get("updated_at") or ""
+                if not aid or not title or not created_at:
                     continue
-
-                with XT_LOCK:
-                    if aid in SEEN_XT_IDS:
-                        continue
-
-                title = a.get("title", "") or ""
-                url = a.get("html_url") or (a.get("url") or "")
-                created_at = a.get("created_at") or a.get("updated_at")
-                if not created_at:
-                    with XT_LOCK:
-                        SEEN_XT_IDS.add(aid)
-                    continue
-
-                ts_ms = iso_to_ms(created_at)
-                if _is_too_old(ts_ms):
-                    with XT_LOCK:
-                        SEEN_XT_IDS.add(aid)
-                    continue
-
-                tickers = [t for t in extract_tickers(title) if t != "XT"]
-
-                if any(t not in TOPIC_CRYPTOS for t in tickers):
-                    passed_parts = []
-                    for t in tickers:
-                        allowed, bin_ok, byb_ok, _ = passes_futures_gate("XT", t, session)
-                        if allowed:
-                            passed_parts.append(format_token_flags(t, bin_ok, byb_ok))
-
-                    if passed_parts:
-                        date_str = get_utc3_time(ts_ms)
-                        safe_log("[MATCH] XT passed: " + ", ".join([re.sub(r"<.*?>", "", p) for p in passed_parts]))
-
-                        safe_title = html.escape(title, quote=False)
-                        safe_url = html.escape(url, quote=True)
-
-                        msg = (
-                            f"*** XT ALERT ***\n"
-                            f"Time: {html.escape(date_str)} (UTC+3)\n"
-                            f"Token: {', '.join(passed_parts)}\n"
-                            f"Title: {safe_title}\n"
-                            f"<a href=\"{safe_url}\">[Link] Open Announcement</a>"
-                        )
-                        send_telegram_msg(msg, parse_mode="HTML")
-                        trigger_ringer()
-                    else:
-                        safe_log(f"[SKIP] XT: no tickers passed. Extracted={tickers}")
-
-                with XT_LOCK:
-                    SEEN_XT_IDS.add(aid)
+                ts = iso_to_ms(created_at)
+                handle_alert("XT", aid, title, ts, url or "https://xtsupport.zendesk.com")
 
             time.sleep(XT_POLL_INTERVAL_SEC)
 
@@ -621,78 +631,34 @@ def monitor_xt():
             time.sleep(8)
 
 
-# ------------------------
-# KuCoin: fetch new listings via KuCoin announcements API
-# ------------------------
-def fetch_kucoin_new_listings(session: requests.Session, page_size: int = 20):
-    params = {
-        "currentPage": 1,
-        "pageSize": page_size,
-        "annType": KUCOIN_ANN_TYPE,
-        "lang": KUCOIN_LANG,
-    }
-    resp = session.get(KUCOIN_ANN_URL, params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return (data.get("data") or {}).get("items", [])
-
-
+# ----------------------------
+# KuCoin poller
+# ----------------------------
 def monitor_kucoin():
     safe_log("[STATUS] KuCoin Poller Started")
     session = get_session()
 
     while True:
         try:
-            items = fetch_kucoin_new_listings(session, page_size=20)
+            params = {
+                "currentPage": 1,
+                "pageSize": 20,
+                "annType": KUCOIN_ANN_TYPE,
+                "lang": KUCOIN_LANG,
+            }
+            resp = session.get(KUCOIN_ANN_URL, params=params, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            items = (data.get("data") or {}).get("items", []) or []
 
-            for it in items[:20]:
+            for it in items[:25]:
                 ann_id = str(it.get("annId", ""))
-                if not ann_id:
+                title = it.get("annTitle") or ""
+                url = it.get("annUrl") or ""
+                ts = int(it.get("cTime", 0) or 0)
+                if not ann_id or not title:
                     continue
-
-                with KUCOIN_LOCK:
-                    if ann_id in SEEN_KUCOIN_IDS:
-                        continue
-
-                title = it.get("annTitle", "") or ""
-                url = it.get("annUrl", "") or ""
-                ts_ms = int(it.get("cTime", 0) or 0)
-
-                if ts_ms and _is_too_old(ts_ms):
-                    with KUCOIN_LOCK:
-                        SEEN_KUCOIN_IDS.add(ann_id)
-                    continue
-
-                tickers = [t for t in extract_tickers(title) if t not in ("KUCOIN", "KCS")]
-
-                if any(t not in TOPIC_CRYPTOS for t in tickers):
-                    passed_parts = []
-                    for t in tickers:
-                        allowed, bin_ok, byb_ok, _ = passes_futures_gate("KUCOIN", t, session)
-                        if allowed:
-                            passed_parts.append(format_token_flags(t, bin_ok, byb_ok))
-
-                    if passed_parts:
-                        date_str = get_utc3_time(ts_ms) if ts_ms else get_utc3_time()
-                        safe_log("[MATCH] KuCoin passed: " + ", ".join([re.sub(r"<.*?>", "", p) for p in passed_parts]))
-
-                        safe_title = html.escape(title, quote=False)
-                        safe_url = html.escape(url, quote=True)
-
-                        msg = (
-                            f"*** KUCOIN ALERT ***\n"
-                            f"Time: {html.escape(date_str)} (UTC+3)\n"
-                            f"Token: {', '.join(passed_parts)}\n"
-                            f"Title: {safe_title}\n"
-                            f"<a href=\"{safe_url}\">[Link] Open Announcement</a>"
-                        )
-                        send_telegram_msg(msg, parse_mode="HTML")
-                        trigger_ringer()
-                    else:
-                        safe_log(f"[SKIP] KuCoin: no tickers passed. Extracted={tickers}")
-
-                with KUCOIN_LOCK:
-                    SEEN_KUCOIN_IDS.add(ann_id)
+                handle_alert("KUCOIN", ann_id, title, ts, url or "https://www.kucoin.com")
 
             time.sleep(KUCOIN_POLL_INTERVAL_SEC)
 
@@ -701,9 +667,365 @@ def monitor_kucoin():
             time.sleep(10)
 
 
-# ------------------------
-# Thread: Telegram listener (/status + /stop for ringer)
-# ------------------------
+# ----------------------------
+# Gate.com poller
+# ----------------------------
+def _gate_fetch_listing_ids(html_text: str) -> List[str]:
+    # Extract article IDs like /announcements/article/49001
+    ids = re.findall(r'href="/announcements/article/(\d+)"', html_text)
+    # keep order, unique
+    out = []
+    seen = set()
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _gate_fetch_article(session: requests.Session, aid: str) -> Tuple[str, int, str]:
+    url = f"https://www.gate.com/announcements/article/{aid}"
+    r = session.get(url, timeout=20)
+    r.raise_for_status()
+    t = r.text
+
+    # Title in <title> or <h1>
+    m_title = re.search(r"<h1[^>]*>(.*?)</h1>", t, flags=re.S | re.I)
+    if m_title:
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", m_title.group(1))).strip()
+    else:
+        m2 = re.search(r"<title[^>]*>(.*?)</title>", t, flags=re.S | re.I)
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", (m2.group(1) if m2 else ""))).strip()
+
+    # Timestamp: "2025-12-26 07:40:00 UTC"
+    m_ts = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC", t)
+    ts_ms = 0
+    if m_ts:
+        dt = datetime.strptime(m_ts.group(1) + " " + m_ts.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        ts_ms = int(dt.timestamp() * 1000)
+
+    return title, ts_ms, url
+
+
+def monitor_gate():
+    safe_log("[STATUS] Gate.com Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            r = session.get(GATE_NEWLISTED_URL, timeout=20)
+            r.raise_for_status()
+            ids = _gate_fetch_listing_ids(r.text)
+
+            for aid in ids[:20]:
+                # dedupe early
+                if _seen_once(f"GATE_ID:{aid}"):
+                    continue
+
+                try:
+                    title, ts_ms, url = _gate_fetch_article(session, aid)
+                    if not title:
+                        continue
+                    handle_alert("GATE", aid, title, ts_ms, url)
+                except Exception:
+                    continue
+
+            time.sleep(GATE_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[GATE ERROR] {e}")
+            time.sleep(10)
+
+
+# ----------------------------
+# WEEX poller
+# ----------------------------
+def monitor_weex():
+    safe_log("[STATUS] WEEX Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            r = session.get(WEEX_NEWLISTINGS_URL, timeout=20)
+            r.raise_for_status()
+            text = r.text
+
+            # Pattern tries to capture: link + title + timestamp (YYYY/MM/DD HH:MM:SS)
+            pattern = re.compile(
+                r'href="([^"]*/wiki/[^"]+)"[^>]*>\s*([^<]{3,200}?)\s*</a>.*?(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})',
+                re.S
+            )
+            matches = pattern.findall(text)
+
+            for href, raw_title, dt_str in matches[:30]:
+                title = re.sub(r"\s+", " ", raw_title).strip()
+                if not title or not dt_str:
+                    continue
+                ts = weex_dt_to_ms(dt_str)
+                url = href if href.startswith("http") else ("https://www.weex.com" + href)
+
+                uniq = f"{title}|{dt_str}|{url}"
+                handle_alert("WEEX", uniq, title, ts, url)
+
+            time.sleep(WEEX_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[WEEX ERROR] {e}")
+            time.sleep(10)
+
+
+# ----------------------------
+# BingX Zendesk poller (Spot / Innovation / Futures listing)
+# ----------------------------
+def _bingx_fetch_section_articles(session: requests.Session, section_id: str) -> List[dict]:
+    url = BINGX_ZENDESK_API_TMPL.format(sid=section_id)
+    resp = session.get(url, params={"per_page": 30, "page": 1}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("articles", []) or []
+
+
+def monitor_bingx():
+    safe_log("[STATUS] BingX Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            for label, sid in BINGX_SECTIONS.items():
+                try:
+                    articles = _bingx_fetch_section_articles(session, sid)
+                except Exception as e:
+                    # If a section ID is wrong/removed, don't kill the thread
+                    safe_log(f"[BINGX WARN] Section {label} ({sid}) fetch failed: {e}")
+                    continue
+
+                for a in articles[:25]:
+                    aid = str(a.get("id", ""))
+                    title = a.get("title") or ""
+                    url = a.get("html_url") or a.get("url") or ""
+                    created_at = a.get("created_at") or a.get("updated_at") or ""
+                    if not aid or not title or not created_at:
+                        continue
+                    ts = iso_to_ms(created_at)
+                    handle_alert("BINGX", f"{label}:{aid}", title, ts, url or BINGX_ZENDESK_BASE)
+
+            time.sleep(BINGX_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[BINGX ERROR] {e}")
+            time.sleep(10)
+
+
+# ----------------------------
+# Bitget poller (New listings category page)
+# ----------------------------
+def _bitget_extract_article_ids(html_text: str) -> List[str]:
+    # Grab article links /support/articles/<id>
+    ids = re.findall(r'href="(/support/articles/\d+[^"]*)"', html_text)
+    out = []
+    seen = set()
+    for href in ids:
+        # Normalize to the base path without query
+        href2 = href.split("?")[0]
+        if href2 not in seen:
+            seen.add(href2)
+            out.append(href2)
+    return out
+
+
+def _bitget_fetch_article(session: requests.Session, path: str) -> Tuple[str, int, str]:
+    url = "https://www.bitget.com" + path
+    r = session.get(url, timeout=20)
+    r.raise_for_status()
+    t = r.text
+
+    # Title: try h1 or title tag
+    m_title = re.search(r"<h1[^>]*>(.*?)</h1>", t, flags=re.S | re.I)
+    if m_title:
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", m_title.group(1))).strip()
+    else:
+        m2 = re.search(r"<title[^>]*>(.*?)</title>", t, flags=re.S | re.I)
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", (m2.group(1) if m2 else ""))).strip()
+
+    # Try to find a datetime string in the article page.
+    # Common patterns: 2025-12-26 07:40:00  OR  Dec 19, 2025
+    ts_ms = 0
+    m_dt1 = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", t)
+    if m_dt1:
+        dt = datetime.strptime(m_dt1.group(1) + " " + m_dt1.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        ts_ms = int(dt.timestamp() * 1000)
+    else:
+        m_dt2 = re.search(r"([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})", t)
+        if m_dt2:
+            dt = datetime.strptime(m_dt2.group(1), "%b %d, %Y").replace(tzinfo=timezone.utc)
+            ts_ms = int(dt.timestamp() * 1000)
+
+    return title, ts_ms, url
+
+
+def monitor_bitget():
+    safe_log("[STATUS] Bitget Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            r = session.get(BITGET_NEWLISTINGS_URL, timeout=20)
+            r.raise_for_status()
+            paths = _bitget_extract_article_ids(r.text)
+
+            for path in paths[:25]:
+                # early dedupe
+                if _seen_once(f"BITGET_PATH:{path}"):
+                    continue
+                try:
+                    title, ts_ms, url = _bitget_fetch_article(session, path)
+                    if not title:
+                        continue
+                    handle_alert("BITGET", path, title, ts_ms, url)
+                except Exception:
+                    continue
+
+            time.sleep(BITGET_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[BITGET ERROR] {e}")
+            time.sleep(10)
+
+
+# ----------------------------
+# MEXC announcements poller (new listings)
+# ----------------------------
+def _mexc_extract_announcement_paths(html_text: str) -> List[str]:
+    # Try common announcement link patterns
+    # e.g. /support/articles/xxxxx or /announcements/xxxxx
+    paths = re.findall(r'href="(/announcements/[^"]+)"', html_text)
+    paths += re.findall(r'href="(/support/articles/\d+[^"]*)"', html_text)
+
+    out = []
+    seen = set()
+    for p in paths:
+        p2 = p.split("?")[0]
+        if p2 not in seen:
+            seen.add(p2)
+            out.append(p2)
+    return out
+
+
+def _mexc_fetch_article(session: requests.Session, path: str) -> Tuple[str, int, str]:
+    if path.startswith("http"):
+        url = path
+    else:
+        url = "https://www.mexc.com" + path
+
+    r = session.get(url, timeout=20)
+    r.raise_for_status()
+    t = r.text
+
+    # Title
+    m_title = re.search(r"<h1[^>]*>(.*?)</h1>", t, flags=re.S | re.I)
+    if m_title:
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", m_title.group(1))).strip()
+    else:
+        m2 = re.search(r"<title[^>]*>(.*?)</title>", t, flags=re.S | re.I)
+        title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", (m2.group(1) if m2 else ""))).strip()
+
+    # Try meta published time (common on many news pages)
+    ts_ms = 0
+    m_meta = re.search(r'article:published_time"\s+content="([^"]+)"', t)
+    if m_meta:
+        try:
+            ts_ms = iso_to_ms(m_meta.group(1))
+        except Exception:
+            ts_ms = 0
+
+    # Fallback: look for "YYYY-MM-DD HH:MM:SS" + optional UTC
+    if not ts_ms:
+        m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", t)
+        if m_dt:
+            dt = datetime.strptime(m_dt.group(1) + " " + m_dt.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            ts_ms = int(dt.timestamp() * 1000)
+
+    return title, ts_ms, url
+
+
+def monitor_mexc():
+    safe_log("[STATUS] MEXC Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            r = session.get(MEXC_NEWLISTINGS_URL, timeout=20)
+            r.raise_for_status()
+            paths = _mexc_extract_announcement_paths(r.text)
+
+            for path in paths[:25]:
+                if _seen_once(f"MEXC_PATH:{path}"):
+                    continue
+                try:
+                    title, ts_ms, url = _mexc_fetch_article(session, path)
+                    if not title:
+                        continue
+                    handle_alert("MEXC", path, title, ts_ms, url)
+                except Exception:
+                    continue
+
+            time.sleep(MEXC_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[MEXC ERROR] {e}")
+            time.sleep(10)
+
+
+# ----------------------------
+# Kraken RSS poller
+# ----------------------------
+def monitor_kraken():
+    safe_log("[STATUS] Kraken Poller Started")
+    session = get_session()
+
+    while True:
+        try:
+            r = session.get(KRAKEN_ASSET_LISTINGS_RSS, timeout=20)
+            r.raise_for_status()
+
+            root = ET.fromstring(r.text)
+            channel = root.find("channel")
+            if channel is None:
+                time.sleep(KRAKEN_POLL_INTERVAL_SEC)
+                continue
+
+            items = channel.findall("item")
+            for it in items[:25]:
+                title = (it.findtext("title") or "").strip()
+                link = (it.findtext("link") or "").strip()
+                guid = (it.findtext("guid") or link or title).strip()
+                pub = (it.findtext("pubDate") or "").strip()
+
+                if not title or not guid:
+                    continue
+
+                ts_ms = 0
+                if pub:
+                    try:
+                        dt = parsedate_to_datetime(pub)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        ts_ms = int(dt.astimezone(timezone.utc).timestamp() * 1000)
+                    except Exception:
+                        ts_ms = 0
+
+                handle_alert("KRAKEN", guid, title, ts_ms, link or "https://blog.kraken.com")
+
+            time.sleep(KRAKEN_POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            safe_log(f"[KRAKEN ERROR] {e}")
+            time.sleep(15)
+
+
+# ----------------------------
+# Telegram listener (/status + /stop for ringer)
+# ----------------------------
 def telegram_listener():
     offset = 0
     session = get_session()
@@ -717,60 +1039,56 @@ def telegram_listener():
             if "result" in data:
                 for update in data["result"]:
                     offset = update["update_id"] + 1
-                    if "message" in update and "text" in update["message"]:
-                        text = update["message"]["text"].lower().strip()
+                    if "message" not in update or "text" not in update["message"]:
+                        continue
 
-                        if str(update["message"]["chat"]["id"]) != TELEGRAM_CHAT_ID:
-                            continue
+                    if str(update["message"]["chat"]["id"]) != TELEGRAM_CHAT_ID:
+                        continue
 
-                        if text in ["/status", "status"]:
-                            msg = (
-                                f"SYSTEM REPORT\n"
-                                f"State: RUNNING\n"
-                                f"Time: {get_utc3_time()} (UTC+3)\n"
-                                f"Filter: <= 1 hour\n"
-                                f"Gate: XT/KuCoin allow Binance USD-M OR Bybit Perp\n"
-                                f"Gate: Bybit announcements require Binance USD-M\n"
-                                f"Ringer: {ringer_status()}\n"
-                                f"Commands: /status, /stop"
-                            )
-                            send_telegram_msg(msg, parse_mode=None)
+                    text = update["message"]["text"].lower().strip()
 
-                        elif text in ["/stop", "stop"]:
-                            stop_ringer()
-                            send_telegram_msg("[SYSTEM] Reminder stopped.", parse_mode=None)
+                    if text in ["/status", "status"]:
+                        msg = (
+                            f"SYSTEM REPORT\n"
+                            f"State: RUNNING\n"
+                            f"Time: {get_utc3_time()} (UTC+3)\n"
+                            f"Filter: <= 1 hour\n"
+                            f"Gate: Binance USD-M OR MEXC Futures\n"
+                            f"Ringer: {ringer_status()}\n"
+                            f"Commands: /status, /stop"
+                        )
+                        send_telegram_msg(msg, parse_mode=None)
+
+                    elif text in ["/stop", "stop"]:
+                        # Stops ONLY the current ringer cycle; future matches can ring again
+                        stop_ringer()
+                        send_telegram_msg("[SYSTEM] Reminder stopped.", parse_mode=None)
 
         except Exception:
             time.sleep(5)
 
 
-# ------------------------
-# Thread: Binance public WS
-# ------------------------
+# ----------------------------
+# Binance public WS
+# ----------------------------
 def run_public_ws():
     def on_public_msg(ws, message):
         try:
             data = json.loads(message)
-            if "data" in data:
-                item = data["data"]
-                if isinstance(item, list) and item:
-                    item = item[0]
-                if isinstance(item, dict) and "title" in item:
-                    ts = int(item.get("releaseDate", 0))
-                    code = str(item.get("code", ""))
+            if "data" not in data:
+                return
+            item = data["data"]
+            if isinstance(item, list) and item:
+                item = item[0]
+            if not isinstance(item, dict):
+                return
 
-                    if ts and _is_too_old(ts):
-                        with SEEN_LOCK:
-                            SEEN_CODES.add(code)
-                        return
-
-                    process_binance_alert(
-                        "Public WebSocket",
-                        item.get("title", ""),
-                        code,
-                        ts,
-                        f"https://www.binance.com/en/support/announcement/{item.get('code')}",
-                    )
+            title = item.get("title") or ""
+            code = str(item.get("code", "")) or title
+            ts = int(item.get("releaseDate", 0) or 0)
+            url = f"https://www.binance.com/en/support/announcement/{item.get('code')}" if item.get("code") else "https://www.binance.com/en/support/announcement"
+            if title:
+                handle_alert("BINANCE", f"PUB:{code}", title, ts, url)
         except Exception:
             pass
 
@@ -783,9 +1101,9 @@ def run_public_ws():
             time.sleep(5)
 
 
-# ------------------------
+# ----------------------------
 # Binance SAPI WS (main loop)
-# ------------------------
+# ----------------------------
 def get_sapi_url():
     base_url = "wss://api.binance.com/sapi/wss"
     params = {
@@ -812,22 +1130,16 @@ def on_sapi_msg(ws, message):
             return
 
         payload = data.get("data", data)
-        if isinstance(payload, dict) and "title" in payload:
-            ts = int(payload.get("publishTime", 0))
-            code = str(payload.get("code", ""))
+        if not isinstance(payload, dict):
+            return
 
-            if ts and _is_too_old(ts):
-                with SEEN_LOCK:
-                    SEEN_CODES.add(code)
-                return
+        title = payload.get("title") or ""
+        code = str(payload.get("code", "")) or title
+        ts = int(payload.get("publishTime", 0) or 0)
+        url = f"https://www.binance.com/en/support/announcement/{payload.get('code')}" if payload.get("code") else "https://www.binance.com/en/support/announcement"
+        if title:
+            handle_alert("BINANCE", f"SAPI:{code}", title, ts, url)
 
-            process_binance_alert(
-                "SAPI Secure Stream",
-                payload.get("title", ""),
-                code,
-                ts,
-                f"https://www.binance.com/en/support/announcement/{payload.get('code')}",
-            )
     except Exception:
         pass
 
@@ -836,57 +1148,68 @@ def on_open(ws):
     safe_log("[STATUS] Connected to SAPI Stream (Layer 1)")
     send_telegram_msg(
         "[SYSTEM] Bot Online (Cloud)\n"
-        "Monitoring Binance + Bybit + XT + KuCoin.\n"
+        "Monitoring: Binance + Bybit + XT + KuCoin + Gate + WEEX + BingX + Bitget + Kraken + MEXC.\n"
+        "Filter: <= 1 hour\n"
+        "Gate: Binance USD-M OR MEXC Futures\n"
         "Commands: /status, /stop",
         parse_mode=None,
     )
 
 
-# ------------------------
-# Main + test flags
-# ------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--test-futures", nargs="+", help="Test Binance USD-M futures (e.g. --test-futures BTC DOGE BREV)")
-    parser.add_argument("--test-bybit-perp", nargs="+", help="Test Bybit USDT perpetual (e.g. --test-bybit-perp BTC DOGE)")
-    parser.add_argument("--test-title", type=str, help='Test a title extraction and show gate results (e.g. --test-title "Listing (ABC)" )')
-    parser.add_argument("--test-title-source", type=str, default="XT", help='Source for --test-title: XT | KUCOIN | BYBIT_ANN (default XT)')
-    args, _ = parser.parse_known_args()
+# ----------------------------
+# Tests (CLI flags)
+# ----------------------------
+def run_tests(args):
+    s = get_session()
 
     if args.test_futures:
-        s = get_session()
         for t in args.test_futures:
             t = t.strip().upper()
             try:
-                quotes = futures_quotes_for(t, s)
-                print(f"{t}: Binance USD-M {'YES' if quotes else 'NO'}  quotes={sorted(list(quotes))}")
-            except Exception as e:
-                print(f"{t}: ERROR {e}")
+                bq = binance_usdm_quotes_for(t, s)
+            except Exception:
+                bq = set()
+            try:
+                ms = mexc_symbols_for(t, s)
+            except Exception:
+                ms = set()
+            print(f"{t}: Binance USD-M={'YES' if bq else 'NO'} quotes={sorted(list(bq))} | MEXC Futures={'YES' if ms else 'NO'} symbols={sorted(list(ms))}")
         sys.exit(0)
 
-    if args.test_bybit_perp:
-        s = get_session()
-        for t in args.test_bybit_perp:
-            t = t.strip().upper()
-            ok, syms = bybit_usdt_perp_symbols(t, s)
-            print(f"{t}: Bybit USDT Perp {'YES' if ok else 'NO'}  symbols={sorted(list(syms))}")
-        sys.exit(0)
-
+    title = None
+    source = None
     if args.test_title:
-        s = get_session()
         title = args.test_title.strip()
         source = args.test_title_source.strip().upper()
-        tickers = extract_tickers(title)
+    elif args.test_bybit_title:
+        title = args.test_bybit_title.strip()
+        source = "BYBIT"
 
+    if title:
+        tickers = extract_tickers(title)
         print(f"SOURCE: {source}")
         print(f"TITLE:  {title}")
         print(f"TICKERS: {tickers}")
-
         for t in tickers:
-            allowed, bin_ok, byb_ok, byb_syms = passes_futures_gate(source, t, s)
-            print(f"- {t}: allowed={allowed}  binance_usdm={bin_ok}  bybit_perp={byb_ok}  bybit_symbols={sorted(list(byb_syms))}")
-
+            if t in TOPIC_CRYPTOS:
+                continue
+            allowed, bin_ok, mex_ok, bq, ms = passes_futures_gate(t, s)
+            print(f"- {t}: allowed={allowed}  binance_usdm={bin_ok} quotes={sorted(list(bq))}  mexc_futures={mex_ok} symbols={sorted(list(ms))}")
         sys.exit(0)
+
+
+# ----------------------------
+# Main
+# ----------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test-futures", nargs="+", help="Test futures gate (e.g. --test-futures BTC DOGE ABC)")
+    parser.add_argument("--test-title", type=str, help='Test ticker extraction + gate (e.g. --test-title "Listing (ABC)" )')
+    parser.add_argument("--test-title-source", type=str, default="XT", help="Label only (default XT)")
+    parser.add_argument("--test-bybit-title", type=str, help='Shortcut for testing Bybit-like titles (e.g. --test-bybit-title "New Listing (ABC)" )')
+    args, _ = parser.parse_known_args()
+
+    run_tests(args)
 
     # Start Telegram sender FIRST
     threading.Thread(target=telegram_sender, daemon=True).start()
@@ -895,21 +1218,29 @@ if __name__ == "__main__":
         f"[SYSTEM] Bot starting...\n"
         f"Time: {get_utc3_time()} (UTC+3)\n"
         f"Filter: <= 1 hour\n"
-        f"Gate: XT/KuCoin allow Binance USD-M OR Bybit Perp\n"
-        f"Gate: Bybit announcements require Binance USD-M\n"
+        f"Gate: Binance USD-M OR MEXC Futures\n"
         f"Commands: /status, /stop",
         parse_mode=None,
     )
 
-    # Start Backgrounds
+    # Start background threads
     threading.Thread(target=telegram_listener, daemon=True).start()
+
     threading.Thread(target=monitor_bybit, daemon=True).start()
     threading.Thread(target=monitor_xt, daemon=True).start()
     threading.Thread(target=monitor_kucoin, daemon=True).start()
+
+    threading.Thread(target=monitor_gate, daemon=True).start()
+    threading.Thread(target=monitor_weex, daemon=True).start()
+    threading.Thread(target=monitor_bingx, daemon=True).start()
+    threading.Thread(target=monitor_bitget, daemon=True).start()
+    threading.Thread(target=monitor_kraken, daemon=True).start()
+    threading.Thread(target=monitor_mexc, daemon=True).start()
+
     threading.Thread(target=monitor_binance_poll, daemon=True).start()
     threading.Thread(target=run_public_ws, daemon=True).start()
 
-    # Main Loop (SAPI)
+    # Main loop: Binance SAPI WS
     while True:
         try:
             ws_url = get_sapi_url()

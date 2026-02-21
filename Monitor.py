@@ -621,16 +621,21 @@ def on_sapi_msg(ws, message):
     except Exception:
         pass
 
+_sapi_announced = False  # Only send "Bot Online" Telegram once per process run
+
 def on_open(ws):
+    global _sapi_announced
     safe_log("[STATUS] Connected to SAPI Stream (Layer 1)")
-    send_telegram_msg(
-        "[SYSTEM] Bot Online (Cloud)\n"
-        "Monitoring: Binance + Bybit + XT + KuCoin + Bitget + Kraken + Weex + BingX + Gate + MEXC.\n"
-        "Filter: <= 1 hour\n"
-        "Gate: Binance USD-M OR MEXC Futures\n"
-        "Commands: /status, /stop",
-        parse_mode=None,
-    )
+    if not _sapi_announced:
+        _sapi_announced = True
+        send_telegram_msg(
+            "[SYSTEM] Bot Online (Cloud)\n"
+            "Monitoring: Binance + Bybit + XT + KuCoin + Bitget + Kraken + Weex + BingX + Gate + MEXC.\n"
+            "Filter: <= 1 hour\n"
+            "Gate: Binance USD-M OR MEXC Futures\n"
+            "Commands: /status, /stop",
+            parse_mode=None,
+        )
 
 # =========================
 # BYBIT
@@ -1225,6 +1230,10 @@ if __name__ == "__main__":
             headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
             ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open, on_message=on_sapi_msg)
             ws.run_forever(ping_interval=20, ping_timeout=10)
+            # run_forever() returns when the connection drops (no exception on a clean server-side close).
+            # Always sleep before reconnecting to prevent a tight spin loop.
+            safe_log("[SAPI RESTART] Connection dropped, reconnecting in 10s...")
+            time.sleep(10)
         except Exception as e:
             safe_log(f"[SAPI RESTART] {e}")
-            time.sleep(5)
+            time.sleep(10)

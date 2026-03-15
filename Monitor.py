@@ -25,10 +25,10 @@ except Exception:
 # =========================
 # CONFIGURATION
 # =========================
-BINANCE_API_KEY = "rlwMpOx5Z7AMvViN1PJjlFZoFQLmkNU6Lpgx3CJeYMUzZUWRX70QFbERWil1akVn"
-BINANCE_SECRET_KEY = "7kYmbK3aflhZ9VEKkYGjNINpyCFQwYiQQItO80vkQ6nSNczghKSflAsjuo3TwKzA"
+BINANCE_API_KEY = ""
+BINANCE_SECRET_KEY = ""
 
-TELEGRAM_TOKEN = "8298805298:AAFNlSm5TuyQNXfmeZ_mXe5Uhjt7doyc4Lg"
+TELEGRAM_TOKEN = ""
 TELEGRAM_CHAT_ID = "5642266820"
 
 # =========================

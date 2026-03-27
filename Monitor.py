@@ -67,6 +67,9 @@ BINGX_ZENDESK_ARTICLES_API = "https://bingxservice.zendesk.com/api/v2/help_cente
 GATE_NEWLISTED_URL = "https://www.gate.com/announcements/newlisted"
 MEXC_NEWLISTINGS_URL = "https://www.mexc.com/announcements/new-listings"
 
+# Upbit: backend JSON API (the notice page is a React SPA; use the raw API)
+UPBIT_NOTICE_API = "https://api.upbit.com/v1/notices"
+
 # Binance USDⓈ-M Futures exchangeInfo (public)
 FAPI_EXCHANGEINFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_CACHE_TTL_SEC = 600  # 10 min
@@ -90,6 +93,9 @@ BINGX_POLL_INTERVAL_SEC = 15  # a bit faster now that it's clean JSON
 GATE_POLL_INTERVAL_SEC = 25
 MEXC_POLL_INTERVAL_SEC = 25
 
+# Upbit notice page — slightly slower since it's a consumer-facing site
+UPBIT_POLL_INTERVAL_SEC = 30
+
 # Binance REST poller
 BINANCE_REST_POLL_INTERVAL_SEC = 3
 
@@ -109,7 +115,7 @@ IGNORE_WORDS = {
     "NETWORK", "WALLET", "UPGRADE", "UPDATE", "TIME", "DATE", "NOW", "NEW", "ALL",
     "DEPOSIT", "TRADE", "COMPLETE", "ADDED", "ADD", "LAUNCH", "PROJECT", "REVIEW",
     "REMOVAL", "NOTICE", "PLAN", "OFFLINE", "PERPETUAL", "CONTRACT", "SWAP", "OPTIONS",
-    "USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "EUR", "GBP", "TRY", "RUB", "AUD", "CAD",
+    "USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "EUR", "GBP", "TRY", "RUB", "AUD", "CAD", "KRW",
     "MAINNET", "INTEGRATION", "SERVICES", "TRADING", "PAIRS", "ROUNDS", "SHARE", "REWARDS",
     "WORTH", "CAMPAIGN", "COMPETITION", "UNLOCK", "MEGA", "SIMPLE", "LOCKED", "PRODUCTS",
     "VOTE", "USER", "USERS", "RULES", "TERMS", "PRIZE", "POOL", "DISTRIBUTION", "MARKET",
@@ -132,6 +138,7 @@ SEEN: Dict[str, Set[str]] = {
     "BINGX": set(),
     "GATE": set(),
     "MEXC": set(),
+    "UPBIT": set(),
 }
 
 # Extra early-dedupe keys (for Gate/MEXC fetching loops)
@@ -614,16 +621,21 @@ def on_sapi_msg(ws, message):
     except Exception:
         pass
 
+_sapi_announced = False  # Only send "Bot Online" Telegram once per process run
+
 def on_open(ws):
+    global _sapi_announced
     safe_log("[STATUS] Connected to SAPI Stream (Layer 1)")
-    send_telegram_msg(
-        "[SYSTEM] Bot Online (Cloud)\n"
-        "Monitoring: Binance + Bybit + XT + KuCoin + Bitget + Kraken + Weex + BingX + Gate + MEXC.\n"
-        "Filter: <= 1 hour\n"
-        "Gate: Binance USD-M OR MEXC Futures\n"
-        "Commands: /status, /stop",
-        parse_mode=None,
-    )
+    if not _sapi_announced:
+        _sapi_announced = True
+        send_telegram_msg(
+            "[SYSTEM] Bot Online (Cloud)\n"
+            "Monitoring: Binance + Bybit + XT + KuCoin + Bitget + Kraken + Weex + BingX + Gate + MEXC.\n"
+            "Filter: <= 1 hour\n"
+            "Gate: Binance USD-M OR MEXC Futures\n"
+            "Commands: /status, /stop",
+            parse_mode=None,
+        )
 
 # =========================
 # BYBIT
@@ -1006,6 +1018,91 @@ def monitor_mexc():
                 cooldown = 10
             time.sleep(5)
 
+# ============================================================
+# Upbit JSON API monitor
+# Only fire on: "Market Support for CoinName(TICKER) (KRW, BTC, USDT Market)"
+# The notice page is a React SPA so we call the backing JSON API directly.
+# Language is requested via Accept-Language header; Upbit returns English
+# titles when the header is set to en-US.
+# ============================================================
+UPBIT_LISTING_RE = re.compile(
+    r"Market\s+Support\s+for\s+.+?\([A-Z0-9]+\)\s*\(",
+    re.IGNORECASE,
+)
+
+def monitor_upbit():
+    safe_log("[STATUS] Upbit Poller Started")
+    session = get_plain_session()
+    headers = {"Accept-Language": "en-US,en;q=0.9"}
+    cooldown = 0
+
+    while True:
+        try:
+            if cooldown > 0:
+                time.sleep(cooldown)
+                cooldown = 0
+
+            resp = session.get(
+                UPBIT_NOTICE_API,
+                params={"page": 1, "per_page": 20},
+                headers=headers,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Unwrap whichever nesting the API uses
+            items: list = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                inner = data.get("data") or data
+                if isinstance(inner, list):
+                    items = inner
+                elif isinstance(inner, dict):
+                    items = (
+                        inner.get("list")
+                        or inner.get("items")
+                        or inner.get("notices")
+                        or []
+                    )
+
+            if not items:
+                safe_log(
+                    f"[UPBIT DEBUG] 0 notices — raw keys: "
+                    f"{list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+                )
+
+            for notice in items[:20]:
+                if not isinstance(notice, dict):
+                    continue
+
+                nid = str(notice.get("id") or notice.get("notice_id") or "")
+                title = (notice.get("title") or "").strip()
+                ts_raw = notice.get("created_at") or notice.get("published_at") or 0
+                url = f"https://upbit.com/service_center/notice?id={nid}&language=en"
+
+                ts_ms = normalize_epoch_to_ms(ts_raw)
+
+                if not nid or not title:
+                    continue
+
+                # Strict filter — only new-listing announcements
+                if not UPBIT_LISTING_RE.search(title):
+                    continue
+
+                handle_alert("UPBIT", nid, title, ts_ms, url)
+
+            time.sleep(UPBIT_POLL_INTERVAL_SEC + random.uniform(0.0, 3.0))
+
+        except Exception as e:
+            safe_log(f"[UPBIT ERROR] {e}")
+            if "403" in str(e) or "404" in str(e):
+                cooldown = 60 + random.randint(0, 30)
+            else:
+                cooldown = 10
+            time.sleep(5)
+
 # =========================
 # TELEGRAM LISTENER (/status, /stop)
 # =========================
@@ -1047,6 +1144,29 @@ def telegram_listener():
 
         except Exception:
             time.sleep(5)
+
+# =========================
+# BINANCE SAPI WS (Layer 1 — background, best-effort)
+# =========================
+def monitor_binance_sapi():
+    """
+    Attempt the unofficial Binance SAPI announcement WebSocket.
+    Layers 2 (public WS) and 3 (REST poll) already cover Binance, so this
+    is strictly additive. If the endpoint keeps rejecting us we back off to
+    60 s between attempts so it doesn't flood the log.
+    """
+    while True:
+        try:
+            ws_url = get_sapi_url()
+            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+            ws = websocket.WebSocketApp(
+                ws_url, header=headers, on_open=on_open, on_message=on_sapi_msg
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            safe_log("[SAPI RESTART] Connection dropped, retrying in 60s...")
+        except Exception as e:
+            safe_log(f"[SAPI RESTART] {e}")
+        time.sleep(60)
 
 # =========================
 # MAIN + TEST FLAGS
@@ -1103,17 +1223,12 @@ if __name__ == "__main__":
 
     threading.Thread(target=monitor_gate, daemon=True).start()
     threading.Thread(target=monitor_mexc, daemon=True).start()
+    threading.Thread(target=monitor_upbit, daemon=True).start()
 
     threading.Thread(target=monitor_binance_poll, daemon=True).start()
     threading.Thread(target=run_public_ws, daemon=True).start()
+    threading.Thread(target=monitor_binance_sapi, daemon=True).start()
 
-    # Main loop (Binance SAPI WS)
+    # Keep the main thread alive — all exchange monitors are daemon threads above.
     while True:
-        try:
-            ws_url = get_sapi_url()
-            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-            ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open, on_message=on_sapi_msg)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            safe_log(f"[SAPI RESTART] {e}")
-            time.sleep(5)
+        time.sleep(3600)
